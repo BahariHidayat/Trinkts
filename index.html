@@ -205,6 +205,7 @@ button.gold-btn:hover:not(:disabled){ background:#bf8319; }
   margin-top:6px;
 }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js"></script>
 </head>
 <body>
 <div id="app">
@@ -216,6 +217,7 @@ button.gold-btn:hover:not(:disabled){ background:#bf8319; }
   <span>Sold: <b id="sold">0</b></span>
   <span>Equipped: <b id="equipped">None</b></span>
   <span>Holding: <b id="holding">None</b></span>
+  <span>Online: <b id="mpCount">-</b></span>
   <div class="audio-controls">
     <button class="alt audio-btn" id="togMusic" title="Toggle Background Music">♪ Music: ON</button>
     <button class="alt audio-btn" id="togSfx" title="Toggle Sound Effects">🔊 SFX: ON</button>
@@ -279,6 +281,18 @@ button.gold-btn:hover:not(:disabled){ background:#bf8319; }
 </div>
 
 <script>
+// ===== MULTIPLAYER CONFIG (Supabase Realtime) =====
+const MP_CONFIG = {
+  SUPABASE_URL: 'https://bdpsccbfidswcnpkahct.supabase.co',
+  SUPABASE_ANON_KEY: 'sb_publishable_f_QoH_UZNEOQvDgF3x04RQ_j49OV_p7',
+  ROOM: 'riverbank-main',
+  SEND_MS: 100,        // max position broadcast rate
+  HEARTBEAT_MS: 1000,  // resend even if idle
+  STALE_MS: 5000,      // drop players not heard from
+  LERP: 0.25,          // remote smoothing
+  NAME_MAX: 12
+};
+
 // ===== GAME CONFIG & CONSTANTS =====
 const CONFIG = {
   KEY: 'riverTrinkets_v2_deluxe',
@@ -1818,7 +1832,7 @@ function heldImg(id){
   img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
   return (heldImgCache[id] = img);
 }
-function drawHeldItem(x, y, dir, frame, id){
+function drawHeldItem(x, y, dir, frame, id, labelDy = 0){
   const t = byId[id]; if(!t) return;
   const X = Math.round(x), Y = Math.round(y), bob = frame === 1 ? -1 : 0;
   const img = heldImg(id), sz = 14;
@@ -1832,7 +1846,7 @@ function drawHeldItem(x, y, dir, frame, id){
   ctx.font = '7px "Press Start 2P", monospace';
   ctx.textAlign = 'center';
   const nw = ctx.measureText(t.n).width;
-  const ty = Y - 29 + bob;
+  const ty = Y - 29 + bob + labelDy;
   ctx.fillStyle = 'rgba(15, 10, 25, 0.82)';
   ctx.fillRect(Math.round(X - nw/2 - 4), ty, Math.round(nw + 8), 11);
   ctx.strokeStyle = '#45355c'; ctx.lineWidth = 1;
@@ -2392,6 +2406,9 @@ function draw(now){
     }
   });
 
+  MP.tick(now);
+  MP.pushEnts(ents, now);
+
   ents.sort((a,b) => a.y - b.y).forEach(e => e.f());
 
   ctx.font = '8px "Press Start 2P", monospace';
@@ -2471,6 +2488,85 @@ $('impf').onchange = async e => {
     else { pending = h; $('link').textContent = 'Reconnect Folder'; msg('Click Reconnect Folder to restore disk sync.'); }
   }catch(e){}
 })();
+
+// ===== MULTIPLAYER (Supabase Realtime Broadcast + Presence) =====
+const MP = (() => {
+  const C = MP_CONFIG;
+  const players = {};
+  const myId = ((crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)) + '').replace(/-/g,'').slice(0, 8);
+  const TUNICS = ['#7a2d2d', '#2d4f7a', '#7a6a2d', '#5b2d7a', '#2d7a72', '#7a4a2d'];
+  const tunicFor = id => TUNICS[[...id].reduce((a, c) => a + c.charCodeAt(0), 0) % TUNICS.length];
+  let name = '', channel = null, enabled = false, lastSend = 0, lastKey = '';
+
+  function setCount(n){ const el = $('mpCount'); if(el) el.textContent = n; }
+
+  function init(){
+    if(!window.supabase || !C.SUPABASE_URL || C.SUPABASE_URL.includes('YOUR-')){
+      setCount('offline'); return;
+    }
+    try { name = localStorage.getItem('rt_name') || ''; } catch(e){}
+    if(!name){
+      name = (prompt('Enter your player name:') || '').trim().slice(0, C.NAME_MAX) || ('Player' + myId.slice(0, 3));
+      try { localStorage.setItem('rt_name', name); } catch(e){}
+    }
+    const client = supabase.createClient(C.SUPABASE_URL, C.SUPABASE_ANON_KEY);
+    channel = client.channel(C.ROOM, { config: { broadcast: { self: false }, presence: { key: myId } } });
+    channel
+      .on('broadcast', { event: 'pos' }, ({ payload }) => onPos(payload))
+      .on('presence', { event: 'sync' }, () => setCount(Object.keys(channel.presenceState()).length))
+      .on('presence', { event: 'join' }, ({ key, newPresences }) => {
+        if(key === myId) return;
+        log(`<b>${esc((newPresences[0] && newPresences[0].name) || 'A player')}</b> joined the river.`);
+      })
+      .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
+        if(key === myId) return;
+        delete players[key];
+        log(`<b>${esc((leftPresences[0] && leftPresences[0].name) || 'A player')}</b> left.`);
+      })
+      .subscribe(status => {
+        if(status === 'SUBSCRIBED'){ enabled = true; channel.track({ name }); }
+        else if(status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED'){ enabled = false; setCount('offline'); }
+      });
+  }
+
+  const esc = t => String(t).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  function onPos(p){
+    if(!p || p.id === myId) return;
+    let r = players[p.id];
+    if(!r || r.zone !== p.zone){ r = players[p.id] = { x: p.x, y: p.y }; }
+    Object.assign(r, { tx: p.x, ty: p.y, dir: p.dir, zone: p.zone, mv: p.mv, held: p.held, name: String(p.name || '').slice(0, C.NAME_MAX), seen: performance.now() });
+  }
+
+  function tick(now){
+    if(!enabled || now - lastSend < C.SEND_MS) return;
+    const moving = !search && !!(held.l || held.r || held.u || held.d);
+    const heldId = (S.held && S.inv[S.held] > 0) ? S.held : null;
+    const payload = { id: myId, name, x: Math.round(P.x), y: Math.round(P.y), dir: P.dir, zone, mv: moving, held: heldId };
+    const key = JSON.stringify([payload.x, payload.y, payload.dir, payload.zone, payload.mv, payload.held]);
+    if(key === lastKey && now - lastSend < C.HEARTBEAT_MS) return;
+    lastKey = key; lastSend = now;
+    channel.send({ type: 'broadcast', event: 'pos', payload });
+  }
+
+  function pushEnts(ents, now){
+    for(const id in players){
+      const r = players[id];
+      if(now - r.seen > C.STALE_MS){ delete players[id]; continue; }
+      if(r.zone !== zone) continue;
+      r.x += (r.tx - r.x) * C.LERP;
+      r.y += (r.ty - r.y) * C.LERP;
+      ents.push({ y: r.y, f: () => {
+        const fr = r.mv ? Math.floor(now / 130) % 2 : 0;
+        drawCharacter(r.x, r.y, { hairColor: '#2b1b0e', skinColor: '#f5cba7', tunicColor: tunicFor(id), pantsColor: '#4a3525', hatType: 'cap' }, fr, r.dir || 'd', r.name || 'Player');
+        if(r.held && byId[r.held]) drawHeldItem(r.x, r.y, r.dir || 'd', fr, r.held, -12);
+      }});
+    }
+  }
+
+  return { init, tick, pushEnts };
+})();
+MP.init();
 
 log('Welcome to <b>Riverbank Trinkets Deluxe</b>!');
 log('Search the riverbank for trinkets, or travel east to the <b>Town Centre</b> to visit the <b>Pawn Stall</b> &amp; <b>Grand Casino</b>.');
